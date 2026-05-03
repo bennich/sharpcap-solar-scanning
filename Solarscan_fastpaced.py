@@ -234,6 +234,16 @@ def find_solar_limb():
 # ── Dec centering ─────────────────────────────────────────────────────────────
 def center_dec():
     """Nudge Dec until left-half and right-half means are balanced."""
+    # On a German Equatorial mount the camera orientation flips after a
+    # meridian flip, so the Dec nudge direction has to be inverted on the
+    # opposite side of the pier. ASCOM SideOfPier: 0 = pierEast, 1 = pierWest.
+    try:
+        side = int(mount.SideOfPier)
+    except:
+        side = 0
+        print("  Dec: SideOfPier not exposed by driver, assuming pierEast")
+    pier_flip = -1 if side == 1 else 1
+
     for iteration in range(1, DEC_MAX_CORRECTIONS + 1):
         check_abort()
         means = measure_left_right_means()
@@ -247,8 +257,8 @@ def center_dec():
             return False
         offset = (l - r) / denom  # + => sun pushed left, - => pushed right
 
-        print("  Dec {}: L={:.0f} R={:.0f} offset={:+.3f}".format(
-              iteration, l, r, offset), end="")
+        print("  Dec {} (side={}): L={:.0f} R={:.0f} offset={:+.3f}".format(
+              iteration, side, l, r, offset), end="")
 
         if abs(offset) < DEC_CENTER_TOLERANCE:
             print("  OK")
@@ -259,7 +269,7 @@ def center_dec():
         nudge_time = max(nudge_time, 0.1)
         # +offset means left half brighter => sun is pushed left in the frame
         # => nudge Dec in the direction that moves the sun right (toward center).
-        direction = -1 if offset > 0 else 1
+        direction = (-1 if offset > 0 else 1) * pier_flip
 
         mount.MoveAxis(1, direction * DEC_NUDGE_SPEED)
         time.sleep(nudge_time)
