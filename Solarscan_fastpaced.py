@@ -29,6 +29,9 @@
 
 import time
 import clr
+# SharpCap runs IronPython, which can import .NET types via `clr`. We need
+# System.Drawing.Rectangle because that's the type SharpCap's Frame.CutROI
+# expects when picking a sub-region of a frame.
 clr.AddReference("System.Drawing")
 from System.Drawing import Rectangle
 
@@ -37,12 +40,18 @@ from System.Drawing import Rectangle
 # ══════════════════════════════════════════════════════════════════════════════
 
 # ── Hardware ──────────────────────────────────────────────────────────────────
+# Together these define the image scale: arcsec/pixel = 206265 * (PIXEL_SIZE/1000) / FOCAL_LENGTH.
+# SOLAR_DIAMETER varies through the year by ~3% — 1920" is a safe annual mean.
+# SIDEREAL is the ASCOM unit conversion: a "1.0x" mount slew = 15.04"/s of axis motion.
 FOCAL_LENGTH       = 714     # mm
 PIXEL_SIZE         = 2       # um (G3M678M)
 SIDEREAL           = 15.04   # arcsec/s per sidereal multiplier unit
 SOLAR_DIAMETER     = 1920.0  # arcsec
 
 # ── Scanning ──────────────────────────────────────────────────────────────────
+# RETURN_MULTIPLIER and LIMB_SEARCH_SPEED below are sidereal multipliers — the
+# value passed to mount.MoveAxis(). 32x sidereal ≈ 481"/s, fast enough to make
+# repositioning between cycles negligible without exceeding most mount limits.
 ENABLE_CAPTURE     = True
 ENABLE_AUTO_EXP    = True
 NUM_CYCLES         = 1
@@ -80,18 +89,34 @@ EXP_MAX_ATTEMPTS   = 6
 
 # ══════════════════════════════════════════════════════════════════════════════
 
+# 206265 = arcseconds per radian. Multiplied by (pixel size / focal length) in
+# matching length units, this gives the angular size each pixel subtends.
 PIXEL_SCALE = 206265 * (PIXEL_SIZE / 1000.0) / FOCAL_LENGTH
 
+# `SharpCap` is a host-injected global available inside the SharpCap scripting
+# console. Both will be None if the user has not connected a mount/camera; the
+# script does not guard against that — fail loudly is better than silently.
 mount = SharpCap.Mounts.SelectedMount
 cam   = SharpCap.SelectedCamera
 
-_abort = [False]  # flipped by KeyboardInterrupt; checked in every wait loop
+# IronPython 2.7 has no `nonlocal`, so we use a one-element list as a mutable
+# closure cell. Ctrl+C in the SharpCap console raises KeyboardInterrupt at
+# the `try:` block far below; we set the flag there and check it in every
+# wait loop so handlers and watchers can exit cleanly.
+_abort = [False]
 
 def check_abort():
     if _abort[0]:
         raise KeyboardInterrupt()
 
 def ra_diff_arcsec(ra1, ra2):
+    """Signed RA difference in arcsec, handling the 0/24h wrap-around.
+
+    `mount.RA` returns hours in [0, 24). A naive subtraction of 23.9h - 0.1h
+    would give 23.8h (~360°), but the actual angular difference is 0.2h.
+    Anything beyond ±12h crosses the wrap, so add/subtract 24 to bring it
+    back into the short-arc range. 1 hour of RA = 15° = 54000".
+    """
     diff = ra1 - ra2
     if diff > 12:
         diff -= 24
@@ -114,14 +139,23 @@ def full_scale():
 # ── FrameCaptured watcher: latches stats from the live stream ─────────────────
 # The FrameCaptured + Frame.GetStats() pattern used here is borrowed from
 # Patrick Hsieh's SHGScan (https://github.com/FlankerOneTwo/SHGScan).
+#
+# SharpCap fires the camera's FrameCaptured event for every frame in the live
+# preview. We attach a handler, let it run continuously, and latch only the
+# most recent (mean, stddev) pair so the rest of the script can read "current
+# brightness" at any moment without ever stopping the stream. This is the key
+# trick that makes the v2 architecture event-driven.
 class FrameWatcher:
     """Attaches a FrameCaptured handler and latches the most recent (mean, stddev)."""
     def __init__(self, camera):
         self.camera = camera
         self.latest = None
+        # Guards against a frame arriving after stop() has begun unhooking.
         self._active = False
 
     def start(self):
+        # `+=` on a .NET event subscribes the handler. SharpCap will then call
+        # _on_frame on its capture thread for every frame until we unsubscribe.
         self.camera.FrameCaptured += self._on_frame
         self._active = True
 
@@ -130,6 +164,8 @@ class FrameWatcher:
             try:
                 self.camera.FrameCaptured -= self._on_frame
             except:
+                # Some SharpCap builds throw if the handler was already detached
+                # or the camera was disconnected — non-fatal, swallow it.
                 pass
             self._active = False
 
@@ -137,12 +173,17 @@ class FrameWatcher:
         if not self._active:
             return
         try:
+            # Frame.GetStats() returns a .NET Tuple<float, float>:
+            #   Item1 = mean pixel value, Item2 = standard deviation.
+            # IronPython exposes these as attributes (not [0] / [1] indices).
             s = args.Frame.GetStats()
             self.latest = (s.Item1, s.Item2)
         except:
+            # Don't take down the live stream if a single frame's stats fail.
             pass
 
     def wait_first(self, timeout=3.0):
+        """Block until the first frame has populated `latest`, or time out."""
         t0 = time.time()
         while self.latest is None:
             if time.time() - t0 > timeout:
@@ -155,25 +196,42 @@ class FrameWatcher:
 # The Frame.CutROI(Rectangle(...)) approach for measuring sub-regions of a
 # live frame (instead of writing the frame to disk and reading it back) is
 # borrowed from Patrick Hsieh's SHGScan.
+#
+# Unlike FrameWatcher (which keeps running and is read by polling), this
+# helper attaches a handler, takes the *next* frame that arrives, computes
+# left/right half-frame means from it, and detaches. We do this on a single
+# fresh frame (rather than reading FrameWatcher.latest) because Dec centering
+# needs a stable measurement after the mount has settled, not whichever frame
+# happened to be cached during the previous nudge.
 def measure_left_right_means(timeout=3.0):
     """Capture one live frame, split into left and right halves, return means."""
+    # One-element list = mutable closure cell (IronPython 2.7 has no nonlocal).
     result = [None]
 
     def on_frame(sender, args):
+        # Only act on the first frame after subscription; later frames are
+        # ignored so we don't keep doing work after the result is in.
         if result[0] is not None:
             return
         try:
             f = args.Frame
+            # cam.ROI is the camera's currently-set sensor ROI; the live frame
+            # has these dimensions. Splitting at the midpoint gives us two
+            # halves to compare for Dec centering.
             roi = cam.ROI
             w = roi.Width
             h = roi.Height
             mid = w // 2
+            # Frame.CutROI(Rectangle(x, y, w, h)) returns a sub-frame view.
+            # GetStats() on each half gives us per-half (mean, stddev).
             left  = f.CutROI(Rectangle(0,   0, mid,     h))
             right = f.CutROI(Rectangle(mid, 0, w - mid, h))
             ls = left.GetStats()
             rs = right.GetStats()
-            result[0] = (ls.Item1, rs.Item1)
+            result[0] = (ls.Item1, rs.Item1)  # means only — caller compares L vs R
         except Exception as e:
+            # Smuggle the error back across the closure boundary as a tagged
+            # tuple; the caller unpacks and prints it after detaching.
             result[0] = ("error", str(e))
 
     cam.FrameCaptured += on_frame
@@ -185,6 +243,7 @@ def measure_left_right_means(timeout=3.0):
             check_abort()
             time.sleep(0.05)
     finally:
+        # Always detach, even on timeout / abort, so we don't leak handlers.
         try:
             cam.FrameCaptured -= on_frame
         except:
@@ -199,7 +258,17 @@ def measure_left_right_means(timeout=3.0):
 # Using stddev (GetStats().Item2), not mean brightness, as the on-disk vs
 # off-disk signal is an idea taken from Patrick Hsieh's SHGScan. The dynamic
 # dark-baseline thresholding around it is local to this script.
+#
+# Why stddev and not mean: the SHG slit projects a spectrum onto the sensor.
+# When the slit is on the solar disk that spectrum has dark Fraunhofer lines
+# crossing it, so the per-frame stddev is enormous (typ. 10000+ at MONO16).
+# Off-disk the frame is near-uniform sensor noise, so stddev is tiny (10s).
+# The signal is robust whichever way the spectral axis is oriented and does
+# not depend on a particular brightness target.
 def find_solar_limb():
+    # mount.MoveAxis(0, ...) is the RA axis; positive multiplier slews "east"
+    # in the apparent-sky sense (sun appears to drift west across the slit
+    # when the mount moves slower than sidereal in this direction).
     watcher = FrameWatcher(cam)
     watcher.start()
     try:
@@ -209,7 +278,10 @@ def find_solar_limb():
 
         initial_stddev = watcher.latest[1]
 
-        # If clearly on disk, back off until we see dark sky first.
+        # If we started already on disk, find the leading limb by reversing
+        # off the disk first, then resuming the forward search. This keeps the
+        # rest of the routine simple — it only has to handle "we're in dark
+        # sky and need to find the rising edge".
         if initial_stddev > ON_DISK_STDDEV:
             print("  On disk (stddev={:.0f}) - backing up...".format(initial_stddev), end="")
             mount.MoveAxis(0, -RETURN_MULTIPLIER)
@@ -221,7 +293,7 @@ def find_solar_limb():
                     mount.Stop()
                     off_disk = True
                     print(" off after {:.1f}s".format(time.time() - t0))
-                    time.sleep(0.3)
+                    time.sleep(0.3)  # let the mount settle before sampling dark
                     break
                 time.sleep(LIMB_SAMPLE_INTERVAL)
             if not off_disk:
@@ -229,12 +301,18 @@ def find_solar_limb():
                 print(" FAILED")
                 return False
 
-        # Sample dark baseline and compute dynamic threshold.
+        # Sample the actual dark-sky stddev and build a threshold relative to it,
+        # rather than using a fixed absolute number. Hot pixels, gain settings,
+        # and exposure time all change the noise floor; a relative threshold
+        # adapts. We require all three: at least LIMB_DARK_MULT× the floor, at
+        # least floor+300, and at least the absolute LIMB_STDDEV_MIN — whichever
+        # is largest wins, so noisy darks don't trigger spurious "limb found".
         time.sleep(0.2)
         dark = watcher.latest[1]
         threshold = max(dark * LIMB_DARK_MULT, dark + 300.0, LIMB_STDDEV_MIN)
 
-        # Slew forward looking for the stddev jump at the limb.
+        # Slew forward at LIMB_SEARCH_SPEED (4× sidereal) and watch for the
+        # stddev jump that marks the leading limb crossing into the slit.
         mount.MoveAxis(0, LIMB_SEARCH_SPEED)
         t0 = time.time()
         while (time.time() - t0) < LIMB_MAX_SEARCH:
@@ -255,7 +333,13 @@ def find_solar_limb():
 
 # ── Dec centering ─────────────────────────────────────────────────────────────
 def center_dec():
-    """Nudge Dec until left-half and right-half means are balanced."""
+    """Nudge Dec until left-half and right-half means are balanced.
+
+    Strategy: at the disk centre the slit is illuminated symmetrically along
+    its length, so the left and right halves of the frame should have equal
+    mean brightness. If the sun is offset in Dec, one half is brighter than
+    the other; we nudge Dec toward the dimmer side and re-measure.
+    """
     for iteration in range(1, DEC_MAX_CORRECTIONS + 1):
         check_abort()
         means = measure_left_right_means()
@@ -265,8 +349,13 @@ def center_dec():
         l, r = means
         denom = l + r
         if denom <= 0:
+            # Both halves dark — likely off-disk or very over-exposed black.
+            # Nothing useful to do; abort centering rather than guess.
             print("  Dec: no signal")
             return False
+        # Normalised imbalance in [-1, +1]. Sign tells us which half is brighter,
+        # magnitude how far off-centre we are. Dividing by (L+R) cancels overall
+        # brightness, so the value doesn't depend on exposure.
         offset = (l - r) / denom  # + => sun pushed left, - => pushed right
 
         print("  Dec {}: L={:.0f} R={:.0f} offset={:+.3f}".format(
@@ -276,16 +365,22 @@ def center_dec():
             print("  OK")
             return True
 
-        # Scale nudge to the magnitude of the imbalance.
+        # Proportional control: nudge time scales with how far off-centre we
+        # are. Cap the upper end so a misread doesn't trigger a long slew, and
+        # the lower end so a tiny nudge still actually moves the mount past
+        # static friction / gear backlash.
         nudge_time = min(abs(offset) * 8.0, 1.5)
         nudge_time = max(nudge_time, 0.1)
         # +offset means left half brighter => sun is pushed left in the frame
         # => nudge Dec in the direction that moves the sun right (toward center).
         direction = -1 if offset > 0 else 1
 
+        # MoveAxis(1, ...) is the Dec axis (axis index 1); axis 0 is RA.
         mount.MoveAxis(1, direction * DEC_NUDGE_SPEED)
         time.sleep(nudge_time)
         mount.Stop()
+        # Brief settle pause so the next measure_left_right_means() reads a
+        # mechanically-still frame rather than one mid-vibration.
         time.sleep(DEC_SETTLE_TIME)
         print("  nudge {:.2f}s {}".format(nudge_time, "+" if direction > 0 else "-"))
 
@@ -294,16 +389,30 @@ def center_dec():
 
 # ── Histogram percentile measurement ──────────────────────────────────────────
 def measure_percentile_pixel(pct, timeout=3.0):
-    """Capture one frame, return pixel value at the given cumulative percentile."""
+    """Capture one frame, return pixel value at the given cumulative percentile.
+
+    For pct=0.99, this returns the bin index N such that 99% of all pixels in
+    the frame have a value <= N. We use this for auto-exposure: targeting the
+    99.5th percentile is robust against a few hot pixels but still tracks the
+    bright continuum peak of the spectrum, which is what we don't want to clip.
+    """
     result = [None]
 
     def on_frame(sender, args):
         if result[0] is not None:
             return
         try:
+            # CalculateHistogram() returns a Histogram object with a Values
+            # property that is a list-of-channel-arrays. For mono cameras
+            # there is one channel; Values[0] is its bin array. Each bin
+            # holds the pixel count for that pixel value (0..255 for MONO8,
+            # 0..65535 for MONO16).
             h = args.Frame.CalculateHistogram()
             bins = h.Values[0]
             nbins = len(bins)
+            # Total pixel count = sum of all bins. Walk from bin 0 upward and
+            # find the first bin where the running cumulative count crosses
+            # `pct` of the total — that bin index is the percentile pixel value.
             total = 0
             for i in range(nbins):
                 total += bins[i]
@@ -342,10 +451,22 @@ def measure_percentile_pixel(pct, timeout=3.0):
 
 # ── Auto-exposure ─────────────────────────────────────────────────────────────
 def auto_exposure():
-    fs = full_scale()
-    target_val = EXP_TARGET_LEVEL * fs
-    tol_val    = EXP_TOLERANCE * fs
+    """Iteratively scale the exposure so the EXP_PERCENTILE pixel sits at
+    EXP_TARGET_LEVEL of full scale.
 
+    The signal we care about for SHG reconstruction is the continuum peak of
+    the spectrum, which is well above the mean. A mean-based AE would happily
+    drive that peak up into the clipping rail. Instead we look at the high
+    percentile of the histogram and aim it at ~88% of full scale, leaving
+    room above for atmospheric bumps without losing any line detail.
+    """
+    fs = full_scale()
+    target_val = EXP_TARGET_LEVEL * fs  # absolute pixel value we're aiming for
+    tol_val    = EXP_TOLERANCE * fs     # ± window that counts as "converged"
+
+    # cam.Controls.FindByName returns the named control object; its .Value
+    # property is read/write and is the exposure in milliseconds for most
+    # ZWO/QHY/Touptek drivers under SharpCap.
     exp_ctrl = cam.Controls.FindByName("Exposure")
     entry_exp = exp_ctrl.Value  # remember starting value so we can revert on failure
 
@@ -366,14 +487,22 @@ def auto_exposure():
             return True
 
         if p > 0:
-            # Cap step size to prevent runaway on noisy frames / mount-settling artefacts.
+            # Linear approximation: brightness scales roughly with exposure,
+            # so new_exp = current_exp × (target / measured). Clamp the
+            # multiplier to [0.5, 2.0] so a single noisy/blocked frame can't
+            # send the exposure to an extreme; we'll converge over a few
+            # iterations instead.
             ratio = target_val / p
             ratio = max(0.5, min(2.0, ratio))
             new_exp = current_exp * ratio
             exp_ctrl.Value = new_exp
+            # Wait long enough for the new exposure to take effect on at
+            # least one frame before we measure again.
             time.sleep(0.3)
             print("  -> {:.2f}ms".format(new_exp))
         else:
+            # Zero percentile = no signal at all, so the multiplier would
+            # be infinite. Bail rather than ramp exposure into oblivion.
             print("  (no signal)")
             exp_ctrl.Value = entry_exp
             return False
@@ -384,12 +513,20 @@ def auto_exposure():
     return False
 
 # ── Alignment routines ────────────────────────────────────────────────────────
+# do_full_alignment: re-find the limb, walk to disk centre, re-centre Dec, set
+# exposure, then walk back to the limb. This is the slow path, used on cycle 0
+# and every DEC_INTERVAL cycles. Returns the RA of the leading limb.
+#
+# do_quick_realign: just re-find the leading limb. Used on intermediate cycles
+# where Dec/exposure are assumed not to have drifted enough to need re-tuning.
 def do_full_alignment():
     print("\n  Full alignment...")
     if not find_solar_limb():
         return False
-    limb_ra = mount.RA
+    limb_ra = mount.RA  # remembered so we can return here later
 
+    # Time to walk half a solar diameter at RETURN_MULTIPLIER × sidereal.
+    # This puts us roughly at the centre of the disk for Dec measurement.
     half_t = (SOLAR_DIAMETER / 2.0) / (RETURN_MULTIPLIER * SIDEREAL)
     mount.MoveAxis(0, RETURN_MULTIPLIER)
     time.sleep(half_t)
@@ -408,6 +545,7 @@ def do_full_alignment():
         print("  Auto-exposure...")
         auto_exposure()
 
+    # Walk back to the leading limb so the actual scan starts in the right place.
     mount.MoveAxis(0, -RETURN_MULTIPLIER)
     time.sleep(half_t)
     mount.Stop()
@@ -422,10 +560,19 @@ def do_quick_realign():
     return mount.RA
 
 # ── Auto-calculate scan speed from live fps ───────────────────────────────────
+# For a 1:1 reconstruction X:Y ratio we need the slit to traverse exactly one
+# pixel-width of sky per captured frame. So:
+#   scan_speed (arcsec/s) = PIXEL_SCALE (arcsec/px) × fps (frames/s)
+# and the corresponding sidereal multiplier the mount needs is that speed
+# divided by SIDEREAL (15.04"/s per 1× sidereal). This couples the slew
+# directly to the live frame rate, so any FPS change picked up here is
+# automatically compensated.
 fps = cam.CurrentFrameRate
 scan_multiplier = PIXEL_SCALE * fps / SIDEREAL
 scan_speed      = scan_multiplier * SIDEREAL
 crossing_time   = SOLAR_DIAMETER / scan_speed
+# scan_duration includes PADDED_DURATION seconds of dark sky padding on each
+# side of the disk, captured at the same scan_speed.
 scan_duration   = PADDED_DURATION * 2 + crossing_time
 
 # ── Pre-flight info ───────────────────────────────────────────────────────────
@@ -466,6 +613,9 @@ try:
         cycle_start = time.time()
         print("\n-- CYCLE {} of {} --".format(cycle + 1, NUM_CYCLES))
 
+        # Re-do the full alignment (limb + Dec + exposure) on the first cycle
+        # and every DEC_INTERVAL cycles thereafter. Intermediate cycles only
+        # need to re-find the leading limb, which is much cheaper.
         need_full = (cycle == 0) or (cycle % DEC_INTERVAL == 0)
 
         if need_full:
@@ -477,6 +627,8 @@ try:
             print("ABORTING: Could not find solar limb.")
             break
 
+        # Log (cycle, t, RA, Dec) of the leading limb each cycle so we can
+        # report drift against cycle 0 at the end of the session.
         limb_dec = mount.Dec
         drift_log.append((cycle + 1, time.time(), limb_ra, limb_dec))
 
@@ -484,18 +636,25 @@ try:
             ref = drift_log[0]
             dt  = drift_log[-1][1] - ref[1]
             dra = ra_diff_arcsec(drift_log[-1][2], ref[2])
+            # mount.Dec is in degrees; ×3600 → arcsec.
             ddec = (drift_log[-1][3] - ref[3]) * 3600
             if dt > 0:
                 print("  Drift: RA {:+.1f}\"  Dec {:+.1f}\"  ({:.0f}s)".format(
                       dra, ddec, dt))
 
-        # Backup past limb
+        # Step the mount back into dark sky just before the leading limb so
+        # the scan begins on sky and ramps in cleanly. Note the rate here
+        # must match the leading-edge padding scan_duration accounts for
+        # (PADDED_DURATION × scan_speed). Backing up at LIMB_SEARCH_SPEED
+        # would overshoot and cause the scan to stop short of the trailing
+        # limb at low FPS / short focal length.
         mount.MoveAxis(0, -LIMB_SEARCH_SPEED)
         time.sleep(PADDED_DURATION)
         mount.Stop()
         time.sleep(0.2)
 
-        # Scan
+        # The actual scan: kick off capture, slew at the FPS-matched rate
+        # for the full disk-crossing time + 2× padding, then stop.
         if ENABLE_CAPTURE:
             cam.PrepareToCapture()
             cam.RunCapture()
@@ -505,6 +664,8 @@ try:
         if ENABLE_CAPTURE:
             cam.StopCapture()
 
+        # How far the mount actually moved during this cycle, so we can
+        # reverse it at the fast rate to get back to the start.
         displacement = abs(ra_diff_arcsec(mount.RA, limb_ra))
         return_time  = displacement / (RETURN_MULTIPLIER * SIDEREAL)
 
@@ -513,14 +674,17 @@ try:
               "Scan done." if ENABLE_CAPTURE else "Dry run done.",
               displacement, cycle_elapsed))
 
-        # Fast return
+        # Fast return to start position; skipped on the last cycle since the
+        # post-loop "Repositioning to disk center" block handles that case.
         if cycle < NUM_CYCLES - 1:
             mount.MoveAxis(0, -RETURN_MULTIPLIER)
             time.sleep(return_time)
             mount.Stop()
             time.sleep(0.5)
 
-    # Return to disk center
+    # After all cycles: park on disk centre. We were at the trailing-edge end
+    # of the last scan; reverse for return_time, then re-find the leading
+    # limb and step half a disk-diameter forward to the centre.
     print("\nRepositioning to disk center...")
     mount.MoveAxis(0, -RETURN_MULTIPLIER)
     time.sleep(return_time)
@@ -537,6 +701,12 @@ try:
     mount.Stop()
 
 except KeyboardInterrupt:
+    # Set the abort flag so any handlers/watchers still spinning will exit
+    # their wait loops on the next check_abort(). Then make a best-effort
+    # attempt to stop the mount and any in-progress capture — wrapped in
+    # try/except because we may be in any state (mount disconnected,
+    # capture not actually running, etc.) and we never want the cleanup
+    # itself to throw.
     print("\n\n*** ABORTED BY USER ***")
     _abort[0] = True
     try:
@@ -572,6 +742,10 @@ if len(drift_log) > 1:
     print("RA  : {:+.1f}\"  ({:+.1f}\"/min)".format(dra, dra / dt * 60 if dt > 0 else 0))
     print("Dec : {:+.1f}\"  ({:+.1f}\"/min)".format(ddec, ddec / dt * 60 if dt > 0 else 0))
 
+# If drift exceeds 5"/min in either axis, suggest a polar-alignment tweak.
+    # The classic drift-alignment heuristic: large RA drift = azimuth error;
+    # large Dec drift = altitude error. The east/west and up/down hints are
+    # rules of thumb for the northern hemisphere — flip them in the south.
     if dt > 0 and (abs(dra / dt * 60) > 5 or abs(ddec / dt * 60) > 5):
         if abs(dra) > abs(ddec):
             print("-> Adjust azimuth slightly {}".format(
