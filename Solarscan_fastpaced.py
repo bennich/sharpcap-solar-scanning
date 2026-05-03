@@ -12,6 +12,20 @@
 #     via Frame.CutROI, nudges toward the dimmer side.
 #   - Auto-exposure target is a fraction of full scale (bit-depth agnostic).
 #   - Ctrl+C aborts: stops mount, detaches any handler, returns cleanly.
+#
+# Acknowledgements:
+#   The v2 architecture — staying in MONO16 throughout, attaching a
+#   FrameCaptured handler to the live stream, and using
+#   Frame.GetStats().Item2 (stddev) plus Frame.CutROI(Rectangle(...)) to
+#   measure the disk without any temp-file round-trip — is directly
+#   inspired by Patrick Hsieh's (FlankerOneTwo) SHGScan project:
+#       https://github.com/FlankerOneTwo/SHGScan
+#   Huge thanks to Patrick for publishing that code and showing how to do
+#   all the measurement work on the live stream — that approach is what
+#   led to dropping MONO8 and operating purely in MONO16.
+#
+#   Thanks also to Fabio Silvi for the SideOfPier-aware Dec centering
+#   contributed in feat/sideofpier-dec-correction.
 
 import time
 import clr
@@ -98,6 +112,8 @@ def full_scale():
     return 65535.0
 
 # ── FrameCaptured watcher: latches stats from the live stream ─────────────────
+# The FrameCaptured + Frame.GetStats() pattern used here is borrowed from
+# Patrick Hsieh's SHGScan (https://github.com/FlankerOneTwo/SHGScan).
 class FrameWatcher:
     """Attaches a FrameCaptured handler and latches the most recent (mean, stddev)."""
     def __init__(self, camera):
@@ -136,6 +152,9 @@ class FrameWatcher:
         return True
 
 # ── One-shot frame grab: left/right mean via CutROI ───────────────────────────
+# The Frame.CutROI(Rectangle(...)) approach for measuring sub-regions of a
+# live frame (instead of writing the frame to disk and reading it back) is
+# borrowed from Patrick Hsieh's SHGScan.
 def measure_left_right_means(timeout=3.0):
     """Capture one live frame, split into left and right halves, return means."""
     result = [None]
@@ -177,6 +196,9 @@ def measure_left_right_means(timeout=3.0):
     return result[0]
 
 # ── Limb detection ────────────────────────────────────────────────────────────
+# Using stddev (GetStats().Item2), not mean brightness, as the on-disk vs
+# off-disk signal is an idea taken from Patrick Hsieh's SHGScan. The dynamic
+# dark-baseline thresholding around it is local to this script.
 def find_solar_limb():
     watcher = FrameWatcher(cam)
     watcher.start()

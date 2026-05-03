@@ -179,6 +179,24 @@ to:
 If you are not comfortable accepting these risks, do not run this
 script.
 
+## Acknowledgements
+
+The v2 architecture of this script — staying in MONO16 throughout,
+attaching a `FrameCaptured` handler to the live stream, and using
+`Frame.GetStats().Item2` (stddev) and `Frame.CutROI(Rectangle(...))`
+to measure the disk without any temp-file round-trip — is directly
+inspired by **Patrick Hsieh's** (FlankerOneTwo) SHGScan project:
+
+  https://github.com/FlankerOneTwo/SHGScan
+
+Huge thanks to Patrick for publishing that code and demonstrating how
+to do all the measurement work on the live stream — that approach is
+what led to dropping MONO8 and operating purely in MONO16 here.
+
+Thanks also to **Fabio Silvi** for the `SideOfPier`-aware Dec
+correction, which makes the Dec centering routine work on both sides
+of the meridian.
+
 ## License
 
 Released under the **MIT License** — see [LICENSE](LICENSE) for the
