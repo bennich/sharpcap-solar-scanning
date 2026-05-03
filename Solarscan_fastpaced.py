@@ -52,11 +52,19 @@ SOLAR_DIAMETER     = 1920.0  # arcsec
 # RETURN_MULTIPLIER and LIMB_SEARCH_SPEED below are sidereal multipliers — the
 # value passed to mount.MoveAxis(). 32x sidereal ≈ 481"/s, fast enough to make
 # repositioning between cycles negligible without exceeding most mount limits.
+#
+# ENABLE_BIDIRECTIONAL: capture both the forward AND reverse legs of each disk
+# crossing. Doubles scans per cycle, amortises alignment overhead. Reverse SERs
+# come out time-reversed, so reconstruction needs a horizontal flip in JSol'Ex
+# before stacking. Filenames are tagged "_fwd" and "_rev" via SharpCap.TargetName
+# so the two sets are easy to identify in post-processing.
 ENABLE_CAPTURE     = True
 ENABLE_AUTO_EXP    = True
+ENABLE_BIDIRECTIONAL = True
 NUM_CYCLES         = 1
 PADDED_DURATION    = 3       # seconds of sky captured before/after the disk
 RETURN_MULTIPLIER  = 32.0    # fast slew rate (no capture)
+INTER_SCAN_PAUSE   = 0.5     # seconds to let SharpCap flush the SER between fwd/rev
 
 # ── Limb detection (stddev-based) ─────────────────────────────────────────────
 LIMB_SEARCH_SPEED  = 4.0     # forward search multiplier
@@ -135,6 +143,71 @@ def full_scale():
     except:
         pass
     return 65535.0
+
+# ── Mount helpers: solar tracking rate and SlewTo-based return ────────────────
+# Sidereal tracking is ~15.04"/s, but the sun moves at the slightly slower
+# solar rate (~14.96"/s) because Earth orbits the sun. Switching the mount to
+# solar tracking removes ~30 arcsec of drift per minute that would otherwise
+# accumulate during a session. SharpCap exposes this via TrackingRate enum.
+def set_solar_tracking_if_supported():
+    """Switch the mount to solar tracking rate; return the previous rate (or None)."""
+    try:
+        prev = mount.TrackingRate
+        # SharpCap.Mounts.Current is the same object as mount; the .Solar enum
+        # is on the TrackingRate property's type, accessed via the instance.
+        mount.SetTrackingRate(mount.TrackingRate.Solar)
+        print("Tracking: switched to Solar (was {})".format(prev))
+        return prev
+    except Exception as e:
+        # Some mount drivers don't expose tracking rate selection. Sidereal
+        # is still close enough that the script works; we just won't get the
+        # 30"/min drift correction.
+        print("Tracking: SetTrackingRate not supported ({}), staying on driver default".format(e))
+        return None
+
+def restore_tracking_rate(prev):
+    """Best-effort restore of the tracking rate the user had before we started."""
+    if prev is None:
+        return
+    try:
+        mount.SetTrackingRate(prev)
+        print("Tracking: restored to {}".format(prev))
+    except:
+        pass
+
+def slew_to_and_wait(ra_hours, dec_deg, timeout=30.0):
+    """Slew the mount to absolute (RA, Dec) using its own coordinate system.
+
+    More precise than dead-reckoning back at -RETURN_MULTIPLIER for some
+    computed time, because it uses the mount's encoders directly. Saves us
+    from accumulating navigation error across many cycles.
+
+    SharpCap v3 took a RADecPosition object; v4 (which the rest of this
+    script requires) accepts (ra, dec) directly. We try the v4 form first
+    and fall back, just so the script keeps working if anyone runs it on
+    a transitional build.
+    """
+    try:
+        mount.SlewTo(ra_hours, dec_deg)
+    except Exception:
+        try:
+            from SharpCap.Models import RADecPosition  # v3-style API
+            mount.SlewTo(RADecPosition(ra_hours, dec_deg))
+        except Exception as e:
+            print("  SlewTo failed ({}); falling back to dead-reckoning".format(e))
+            return False
+
+    t0 = time.time()
+    while True:
+        check_abort()
+        if not mount.Slewing:
+            return True
+        if time.time() - t0 > timeout:
+            print("  SlewTo timed out after {:.1f}s".format(timeout))
+            try: mount.Stop()
+            except: pass
+            return False
+        time.sleep(0.1)
 
 # ── FrameCaptured watcher: latches stats from the live stream ─────────────────
 # The FrameCaptured + Frame.GetStats() pattern used here is borrowed from
@@ -595,18 +668,28 @@ print("FPS: {:.1f}  Scale: {:.3f}\"/px  Scan: {:.2f}x ({:.1f}\"/s)".format(
 print("Crossing: {:.1f}s  Duration: {:.1f}s  X/Y: {:.3f}".format(
       crossing_time, scan_duration,
       PIXEL_SCALE / (scan_speed / fps)))
-print("Cycles: {}  Return: {:.0f}x  Dec every: {} cycles".format(
-      NUM_CYCLES, RETURN_MULTIPLIER, DEC_INTERVAL))
+print("Cycles: {}  Return: SlewTo  Dec every: {} cycles  Bidir: {}".format(
+      NUM_CYCLES, DEC_INTERVAL, "ON" if ENABLE_BIDIRECTIONAL else "OFF"))
 print("Full scale: {:.0f} ADU  Exp: p{:.1f} -> {:.0%}".format(
       full_scale(), EXP_PERCENTILE * 100, EXP_TARGET_LEVEL))
 print("Est. total: {:.0f}s ({:.1f} min)  (Ctrl+C to abort)".format(
-      est_total, est_total / 60))
+      est_total * (2 if ENABLE_BIDIRECTIONAL else 1), est_total / 60 * (2 if ENABLE_BIDIRECTIONAL else 1)))
 print("=" * 60)
 
 # ── Main cycle loop ───────────────────────────────────────────────────────────
 drift_log = []
 session_start = time.time()
-return_time = 0
+
+# Switch to solar tracking rate for the duration of the session, remembering
+# the previous rate so we can restore it on exit.
+saved_tracking_rate = set_solar_tracking_if_supported()
+
+# Capture the SharpCap target name the user set in the UI so we can suffix
+# it with "_fwd" / "_rev" per scan and restore it afterward.
+try:
+    base_target_name = SharpCap.TargetName
+except:
+    base_target_name = None
 
 try:
     for cycle in range(NUM_CYCLES):
@@ -653,8 +736,13 @@ try:
         mount.Stop()
         time.sleep(0.2)
 
-        # The actual scan: kick off capture, slew at the FPS-matched rate
-        # for the full disk-crossing time + 2× padding, then stop.
+        # ── Forward scan ──────────────────────────────────────────────────
+        # Tag the SER file as the forward leg so post-processing can tell
+        # forward and reverse scans apart in JSol'Ex. Reset the tag after
+        # capture so manual operations stay un-suffixed.
+        if base_target_name and ENABLE_CAPTURE:
+            try: SharpCap.TargetName = base_target_name + "_fwd"
+            except: pass
         if ENABLE_CAPTURE:
             cam.PrepareToCapture()
             cam.RunCapture()
@@ -663,41 +751,62 @@ try:
         mount.Stop()
         if ENABLE_CAPTURE:
             cam.StopCapture()
+        forward_displacement = abs(ra_diff_arcsec(mount.RA, limb_ra))
 
-        # How far the mount actually moved during this cycle, so we can
-        # reverse it at the fast rate to get back to the start.
-        displacement = abs(ra_diff_arcsec(mount.RA, limb_ra))
-        return_time  = displacement / (RETURN_MULTIPLIER * SIDEREAL)
+        # ── Optional reverse scan ────────────────────────────────────────
+        # We're now in dark sky past the trailing limb, sitting in mirror
+        # position to where the forward scan started. Just reverse direction
+        # at -scan_multiplier for the same scan_duration to capture a full
+        # disk crossing in the opposite time direction. JSol'Ex reconstructs
+        # this as a mirror image, so the user must apply horizontal flip
+        # before stacking with the forward scan.
+        if ENABLE_BIDIRECTIONAL:
+            time.sleep(INTER_SCAN_PAUSE)  # let SharpCap flush the forward SER
+            if base_target_name and ENABLE_CAPTURE:
+                try: SharpCap.TargetName = base_target_name + "_rev"
+                except: pass
+            if ENABLE_CAPTURE:
+                cam.PrepareToCapture()
+                cam.RunCapture()
+            mount.MoveAxis(0, -scan_multiplier)
+            time.sleep(scan_duration)
+            mount.Stop()
+            if ENABLE_CAPTURE:
+                cam.StopCapture()
+
+        # Restore the user's original target name so any subsequent manual
+        # captures aren't tagged with stale fwd/rev suffixes.
+        if base_target_name:
+            try: SharpCap.TargetName = base_target_name
+            except: pass
 
         cycle_elapsed = time.time() - cycle_start
-        print("  {} {:.0f}\" moved. Cycle: {:.1f}s".format(
-              "Scan done." if ENABLE_CAPTURE else "Dry run done.",
-              displacement, cycle_elapsed))
+        scan_count = 2 if ENABLE_BIDIRECTIONAL else 1
+        print("  {} {:.0f}\" moved fwd. {} scan(s). Cycle: {:.1f}s".format(
+              "Scan(s) done." if ENABLE_CAPTURE else "Dry run done.",
+              forward_displacement, scan_count, cycle_elapsed))
 
-        # Fast return to start position; skipped on the last cycle since the
-        # post-loop "Repositioning to disk center" block handles that case.
+        # Return to the saved limb position via SlewTo (encoder-precise),
+        # rather than dead-reckoning a fast return. Skipped on the last
+        # cycle since the post-loop "Repositioning to disk center" handles
+        # the final park.
         if cycle < NUM_CYCLES - 1:
-            mount.MoveAxis(0, -RETURN_MULTIPLIER)
-            time.sleep(return_time)
-            mount.Stop()
-            time.sleep(0.5)
+            print("  Returning to saved limb position via SlewTo...")
+            slew_to_and_wait(limb_ra, limb_dec)
+            time.sleep(0.3)
 
-    # After all cycles: park on disk centre. We were at the trailing-edge end
-    # of the last scan; reverse for return_time, then re-find the leading
-    # limb and step half a disk-diameter forward to the centre.
+    # After all cycles: park on disk centre. SlewTo gets us back to the last
+    # leading-limb position, then we walk half a disk-diameter forward at
+    # RETURN_MULTIPLIER (which is fine here — we're not capturing, just parking).
     print("\nRepositioning to disk center...")
-    mount.MoveAxis(0, -RETURN_MULTIPLIER)
-    time.sleep(return_time)
+    if drift_log:
+        ref = drift_log[-1]
+        slew_to_and_wait(ref[2], ref[3])
+    half_t = (SOLAR_DIAMETER / 2.0) / (RETURN_MULTIPLIER * SIDEREAL)
+    mount.MoveAxis(0, RETURN_MULTIPLIER)
+    time.sleep(half_t)
     mount.Stop()
-    time.sleep(0.5)
-
-    if find_solar_limb():
-        half_t = (SOLAR_DIAMETER / 2.0) / (RETURN_MULTIPLIER * SIDEREAL)
-        mount.MoveAxis(0, RETURN_MULTIPLIER)
-        time.sleep(half_t)
-        mount.Stop()
-        print("Centered on solar disk.")
-
+    print("Centered on solar disk.")
     mount.Stop()
 
 except KeyboardInterrupt:
@@ -718,6 +827,15 @@ except KeyboardInterrupt:
             cam.StopCapture()
     except:
         pass
+    # Restore the user's original SharpCap target name on abort too — they
+    # don't want a half-finished session leaving "..._fwd" stuck in the UI.
+    if base_target_name:
+        try: SharpCap.TargetName = base_target_name
+        except: pass
+
+# Always-run cleanup (success, abort, or exception): put the tracking rate
+# back the way we found it, so subsequent observing isn't surprised by it.
+restore_tracking_rate(saved_tracking_rate)
 
 # ── Session summary ───────────────────────────────────────────────────────────
 total_time = time.time() - session_start
