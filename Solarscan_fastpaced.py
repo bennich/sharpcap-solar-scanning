@@ -489,8 +489,12 @@ try:
                 print("  Drift: RA {:+.1f}\"  Dec {:+.1f}\"  ({:.0f}s)".format(
                       dra, ddec, dt))
 
-        # Backup past limb
-        mount.MoveAxis(0, -LIMB_SEARCH_SPEED)
+        # Back up past the leading limb. Use scan_multiplier (not the faster
+        # LIMB_SEARCH_SPEED) so the back-up distance matches the leading-edge
+        # padding that scan_duration accounts for (PADDED_DURATION * scan_speed).
+        # Otherwise the scan ends short of the trailing limb whenever
+        # scan_multiplier << LIMB_SEARCH_SPEED, e.g. low FPS or short FL.
+        mount.MoveAxis(0, -scan_multiplier)
         time.sleep(PADDED_DURATION)
         mount.Stop()
         time.sleep(0.2)
