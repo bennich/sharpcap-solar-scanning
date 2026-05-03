@@ -643,12 +643,12 @@ try:
                       dra, ddec, dt))
 
         # Step the mount back into dark sky just before the leading limb so
-        # the scan begins on sky and ramps in cleanly. Note the rate here
-        # must match the leading-edge padding scan_duration accounts for
+        # the scan begins on sky and ramps in cleanly. The rate here MUST
+        # match the leading-edge padding scan_duration accounts for
         # (PADDED_DURATION × scan_speed). Backing up at LIMB_SEARCH_SPEED
         # would overshoot and cause the scan to stop short of the trailing
         # limb at low FPS / short focal length.
-        mount.MoveAxis(0, -LIMB_SEARCH_SPEED)
+        mount.MoveAxis(0, -scan_multiplier)
         time.sleep(PADDED_DURATION)
         mount.Stop()
         time.sleep(0.2)
